@@ -383,7 +383,7 @@ body::after{content:'';position:fixed;inset:0;background:radial-gradient(ellipse
   <!-- ───── CÂMBIO (col 4) ───── -->
   <div class="sec col-4" data-lbl="FX / MOEDAS">
     <div class="sec-corner"></div>
-    <div class="sec-h">Câmbio <span class="note">// REAIS, EURO, YEN, SHEKEL, RIAL</span></div>
+    <div class="sec-h">Câmbio <span class="note">// REAIS, EURO, YEN, FRANCO, LIBRA</span></div>
     <div id="sec-fx"><div class="loading-row shim">BUSCANDO DADOS…</div></div>
   </div>
 
@@ -579,7 +579,7 @@ body::after{content:'';position:fixed;inset:0;background:radial-gradient(ellipse
 // ║  3. Yahoo Finance     → commodities/índices/bonds (direto)   ║
 // ║  4. Fallback embutido → valores ref., nunca quebra            ║
 // ║                                                              ║
-// ║  Atualização: a cada 60 segundos via /.netlify/functions/    ║
+// ║  Atualização: a cada 120 segundos via Yahoo + ER-API          ║
 // ╚═══════════════════════════════════════════════════════════════╝
 
 // ─── DEFINIÇÕES ──────────────────────────────────────────────────
@@ -591,11 +591,11 @@ const A = { // assets
   gold:   {sym:'GC=F',     ref:3285,   dec:2, pre:'$', grp:'metal'},
   silver: {sym:'SI=F',     ref:32.50,  dec:3, pre:'$', grp:'metal'},
   plat:   {sym:'PL=F',     ref:980,    dec:2, pre:'$', grp:'metal'},
-  usd_brl:{sym:null,       ref:5.720,  dec:4, pre:'',  grp:'fx'},
-  eur_usd:{sym:null,       ref:1.082,  dec:4, pre:'',  grp:'fx'},
-  usd_jpy:{sym:null,       ref:149.8,  dec:2, pre:'',  grp:'fx'},
-  usd_ils:{sym:null,       ref:3.680,  dec:4, pre:'',  grp:'fx'},
-  usd_irr:{sym:null,       ref:42100,  dec:0, pre:'',  grp:'fx'},
+  usd_brl:{sym:'USDBRL=X', ref:5.720,  dec:4, pre:'',  grp:'fx'},
+  eur_usd:{sym:'EURUSD=X', ref:1.082,  dec:4, pre:'',  grp:'fx'},
+  usd_jpy:{sym:'USDJPY=X', ref:149.8,  dec:2, pre:'',  grp:'fx'},
+  usd_chf:{sym:'USDCHF=X', ref:0.895,  dec:4, pre:'',  grp:'fx'},
+  gbp_usd:{sym:'GBPUSD=X', ref:1.268,  dec:4, pre:'',  grp:'fx'},
   zt:     {sym:'ZT=F',     ref:102.2,  dec:3, pre:'',  grp:'rates'},
   zn:     {sym:'ZN=F',     ref:110.8,  dec:3, pre:'',  grp:'rates'},
   zb:     {sym:'ZB=F',     ref:115.2,  dec:3, pre:'',  grp:'rates'},
@@ -710,24 +710,50 @@ function afterSparks(keys) {
   }
 }
 
-// ─── FETCH: FX ───────────────────────────────────────────────────
-// Moved to server-side Netlify Function: /.netlify/functions/prices
+// ─── FETCH: FX via Yahoo (proper 1-day variation) ────────────────
+// FX pairs now fetched via Yahoo Finance just like commodities,
+// so prev = actual previous close, not a static reference value.
+// Fallback: open.er-api / frankfurter (no prev available there)
 async function fetchFXDirect() {
+  // Try Yahoo first for all FX pairs — gives real 1-day prev close
+  const fxSyms = {
+    'USDBRL=X':'usd_brl', 'EURUSD=X':'eur_usd',
+    'USDJPY=X':'usd_jpy', 'USDCHF=X':'usd_chf', 'GBPUSD=X':'gbp_usd'
+  };
+  const results = {};
+  let yahooFxOk = 0;
+  await Promise.allSettled(
+    Object.keys(fxSyms).map(sym =>
+      yahooQ(sym).then(r => { if(r) { results[fxSyms[sym]] = r; yahooFxOk++; } })
+    )
+  );
+  if (yahooFxOk >= 3) {
+    // Apply directly with real prev from Yahoo
+    for (const k in results) {
+      const r = results[k];
+      applyQ(k, r.price, r.prev, r.history);
+    }
+    return {src:'YAHOO-FX', yahooFx:true};
+  }
+
+  // Fallback: REST FX APIs (no accurate prev, use last known)
   const sources = [
     {
       url:'https://open.er-api.com/v6/latest/USD',
       parse: j => j.result==='success'&&j.rates ? {
         usd_brl:+j.rates.BRL, usd_jpy:+j.rates.JPY,
-        usd_ils:+j.rates.ILS,
+        usd_chf:+j.rates.CHF,
+        gbp_usd:j.rates.GBP?+(1/j.rates.GBP):null,
         eur_usd:j.rates.EUR?+(1/j.rates.EUR):null,
         src:'OPEN-ER-API'
       } : null
     },
     {
-      url:'https://api.frankfurter.app/latest?from=USD&to=BRL,JPY,ILS,EUR',
+      url:'https://api.frankfurter.app/latest?from=USD&to=BRL,JPY,CHF,EUR,GBP',
       parse: j => j.rates ? {
         usd_brl:+j.rates.BRL, usd_jpy:+j.rates.JPY,
-        usd_ils:+j.rates.ILS,
+        usd_chf:+j.rates.CHF,
+        gbp_usd:j.rates.GBP?+(1/j.rates.GBP):null,
         eur_usd:j.rates.EUR?+(1/j.rates.EUR):null,
         src:'FRANKFURTER'
       } : null
@@ -746,15 +772,35 @@ async function fetchFXDirect() {
 }
 
 // ─── FETCH: YAHOO via CORS proxy cascade ─────────────────────────
-// Server-side fetch via Netlify Function (no CORS proxy needed)
 async function fetchAllServer() {
-  try {
-    const ctrl = new AbortController();
-    setTimeout(() => ctrl.abort(), 15000);
-    const r = await fetch('/.netlify/functions/prices', { signal: ctrl.signal, cache: 'no-store' });
-    if (!r.ok) return null;
-    return await r.json();
-  } catch(e) { return null; }
+  return null; // no server-side function on GitHub Pages
+}
+
+async function yahooQ(sym) {
+  const yUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=10d`;
+  const proxies = [
+    `https://corsproxy.io/?${encodeURIComponent(yUrl)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(yUrl)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(yUrl)}`,
+  ];
+  for (const px of proxies) {
+    try {
+      const ctrl=new AbortController(); setTimeout(()=>ctrl.abort(),9000);
+      const r = await fetch(px,{signal:ctrl.signal,cache:'no-store'});
+      if(!r.ok) continue;
+      const j = await r.json();
+      const res = j?.chart?.result?.[0];
+      if(!res) continue;
+      const meta = res.meta;
+      const price = meta.regularMarketPrice;
+      // KEY FIX: use second-to-last close as prev = real 1-day variation
+      const closes = (res.indicators?.quote?.[0]?.close||[]).filter(v=>v!=null&&!isNaN(v)&&v>0);
+      const prev = closes.length >= 2 ? closes[closes.length-2] : (meta.chartPreviousClose || meta.previousClose || price);
+      if(!price||price<=0) continue;
+      return {price, prev, history: closes.length>=4 ? closes : null};
+    } catch(e) {}
+  }
+  return null;
 }
 
 const _symToKey = {};
@@ -786,7 +832,7 @@ async function fetchAll() {
     // Apply FX data
     if (data.fx) {
       _fxSrc = data.fx.src || 'SERVER';
-      for (const k of ['usd_brl','usd_jpy','usd_ils','eur_usd']) {
+      for (const k of ['usd_brl','usd_jpy','usd_chf','gbp_usd','eur_usd']) {
         if(data.fx[k]&&data.fx[k]>0) applyQ(k, data.fx[k], S[k].prev||data.fx[k]*.999, null);
       }
     }
@@ -804,13 +850,13 @@ async function fetchAll() {
   } else {
     // 2. Fallback: direct client-side FX fetch
     const fx = await fetchFXDirect();
-    if (fx) {
+    if (fx && !fx.yahooFx) {
       _fxSrc = fx.src;
-      for (const k of ['usd_brl','usd_jpy','usd_ils','eur_usd']) {
+      for (const k of ['usd_brl','usd_jpy','usd_chf','gbp_usd','eur_usd']) {
         if(fx[k]&&fx[k]>0) applyQ(k, fx[k], S[k].prev||fx[k]*.999, null);
       }
-    } else {
-      for (const k of ['usd_brl','usd_jpy','usd_ils','eur_usd']) {
+    } else if (!fx) {
+      for (const k of ['usd_brl','usd_jpy','usd_chf','gbp_usd','eur_usd']) {
         if(!S[k].ok) { const r=A[k].ref; applyQ(k, r*(1+(Math.random()-.5)*.002), r*.999, null); }
       }
       _fxSrc = 'REF';
@@ -819,8 +865,25 @@ async function fetchAll() {
     _mktOk = 0;
   }
 
-  // IRR always fixed reference
-  applyQ('usd_irr', 42100, 42050, null);
+  // Also fetch FX via Yahoo for proper 1-day variation
+  if (!data) {
+    await fetchFXDirect(); // handles FX via Yahoo + fallback
+    _fxSrc = S.usd_brl.ok ? 'YAHOO-FX' : 'REF';
+
+    // Fetch all non-FX market symbols via Yahoo proxy
+    const mktKeys = Object.keys(A).filter(k=>A[k].sym && A[k].grp!=='fx');
+    _mktTotal = mktKeys.length;
+    _mktOk = 0;
+    for (const batch of chunks(mktKeys, 5)) {
+      const results = await Promise.allSettled(batch.map(k=>yahooQ(A[k].sym).then(r=>({k,r}))));
+      for (const res of results) {
+        if(res.status==='fulfilled'&&res.value.r) {
+          const {k,r} = res.value;
+          if(applyQ(k,r.price,r.prev,r.history)) _mktOk++;
+        }
+      }
+    }
+  }
 
   // Fallback for anything still null
   for (const k in A) {
@@ -876,8 +939,8 @@ function renderFX() {
     ['usd_brl','USD/BRL','DÓLAR · REAL BRASILEIRO'],
     ['eur_usd','EUR/USD','EURO · DÓLAR AMERICANO'],
     ['usd_jpy','USD/JPY','DÓLAR · YEN JAPONÊS'],
-    ['usd_ils','USD/ILS','DÓLAR · SHEKEL ISRAELENSE'],
-    ['usd_irr','USD/IRR','DÓLAR · RIAL IRANIANO (REF.)'],
+    ['usd_chf','USD/CHF','DÓLAR · FRANCO SUÍÇO'],
+    ['gbp_usd','GBP/USD','LIBRA ESTERLINA · DÓLAR'],
   ];
   el.innerHTML = rows.map(([k,n,c])=>arowHtml(k,n,c)).join('');
   afterSparks(rows.map(r=>r[0]));
@@ -994,7 +1057,7 @@ function renderTicker() {
     ['PRATA','silver',3,'$'],['S&P FUT','es',2,''],['NASDAQ','nq',2,''],
     ['USD/BRL','usd_brl',4,''],['EUR/USD','eur_usd',4,''],['VIX','vix',2,''],
     ['T-10Y','zn',3,''],['IBOV','ibov',0,''],['DAX','dax',2,''],
-    ['GÁS NAT.','ng',3,'$'],['USD/JPY','usd_jpy',2,''],['USD/ILS','usd_ils',4,''],
+    ['GÁS NAT.','ng',3,'$'],['USD/JPY','usd_jpy',2,''],['USD/CHF','usd_chf',4,''],['GBP/USD','gbp_usd',4,''],
   ];
   const make=([l,k,d,p])=>{
     const s=S[k];
